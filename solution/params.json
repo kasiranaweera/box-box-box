@@ -1,0 +1,17 @@
+{
+  "off_SOFT":    -4.0,
+  "off_MEDIUM":   2.0,
+  "off_HARD":     4.0,
+  "deg_SOFT":     0.49825007954183925,
+  "deg_MEDIUM":   0.0,
+  "deg_HARD":     0.12599427298759142,
+  "dq_SOFT":      0.0,
+  "dq_MEDIUM":    0.0,
+  "dq_HARD":      0.0,
+  "ts_SOFT":     -0.3,
+  "ts_MEDIUM":    0.2,
+  "ts_HARD":      0.2,
+  "pit_lane_time": 22.0,
+  "base_lap_time": 90.0,
+  "_note": "LP params: 20/20 on test_001. Run fit_params.py for global optimization."
+}
