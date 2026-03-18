@@ -1,85 +1,47 @@
 #!/usr/bin/env python3
 """
-Box Box Box — Global Parameter Fitter
-=======================================
-Finds the best global compound params across all 30k historical races.
+Box Box Box — Fast Chunked Parameter Fitter
+=============================================
+Processes 30k races in chunks, saves progress after each chunk.
+Much faster than full DE — uses LP per chunk then averages.
 
-Key findings:
-- pit_lane_time and base_lap_time are PER-RACE (from race_config) — they cancel
-  in pairwise comparisons within a race.
-- Only the 12 compound params are global.
-- Times are rounded to 4dp before sorting (handles fp near-ties).
-- pit_stop semantics: lap N = complete N laps on old tyre (Mode B).
+Usage:
+  python solution/fit_params.py --data-dir data --chunk-size 1000
+  python solution/fit_params.py --data-dir data --quick   # just 2000 races, ~2 min
+  python solution/fit_params.py --data-dir data --lp-only # LP only, fastest
 """
-
-import json, glob, os, sys, argparse
+import json, glob, os, sys, argparse, time
 import numpy as np
-from scipy.optimize import linprog, minimize, differential_evolution
+from scipy.optimize import linprog, minimize
 import warnings; warnings.filterwarnings('ignore')
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from race_simulator import (parse_stints, driver_time, simulate_race,
-                            DEFAULT_PARAMS, T_REF, TIME_ROUND)
+sys.path.insert(0, os.path.dirname(__file__))
+from race_simulator import parse_stints, driver_time, simulate_race, DEFAULT_PARAMS, T_REF, TIME_ROUND, _c
 
-NAMES = ['off_SOFT','off_MEDIUM','off_HARD',
-         'deg_SOFT','deg_MEDIUM','deg_HARD',
-         'dq_SOFT', 'dq_MEDIUM', 'dq_HARD',
-         'ts_SOFT', 'ts_MEDIUM', 'ts_HARD']
+NAMES  = ['off_SOFT','off_MEDIUM','off_HARD',
+          'deg_SOFT','deg_MEDIUM','deg_HARD',
+          'dq_SOFT','dq_MEDIUM','dq_HARD',
+          'ts_SOFT','ts_MEDIUM','ts_HARD']
 
-BOUNDS = [
-    (-5.0, 0.0),   # off_SOFT
-    (-1.0, 3.0),   # off_MEDIUM
-    ( 0.0, 6.0),   # off_HARD
-    ( 0.0, 1.5),   # deg_SOFT
-    ( 0.0, 0.5),   # deg_MEDIUM
-    ( 0.0, 0.5),   # deg_HARD
-    ( 0.0, 0.05),  # dq_SOFT
-    ( 0.0, 0.03),  # dq_MEDIUM
-    ( 0.0, 0.02),  # dq_HARD
-    (-0.5, 0.5),   # ts_SOFT
-    (-0.3, 0.3),   # ts_MEDIUM
-    (-0.3, 0.3),   # ts_HARD
-]
+BOUNDS = [(-5,0),(-2,3),(0,5),
+          (0,1),(0,.5),(0,.3),
+          (0,.06),(0,.05),(0,.04),
+          (-.4,.4),(-.3,.3),(-.3,.3)]
 
-INIT = np.array([-4.0, 2.0, 4.0,
-                  0.498, 0.0, 0.126,
-                  0.0,   0.0, 0.0,
-                 -0.3,   0.2, 0.2])
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-# ── Data loading ──────────────────────────────────────────────────
+def sa(n):  return n*(n-1)/2
+def sa2(n): return n*(n-1)*(2*n-1)/6
 
-def load_all(data_dir, max_races=30000):
-    files = sorted(glob.glob(os.path.join(data_dir, 'historical_races', '*.json')))
-    races = []
-    for f in files:
-        if len(races) >= max_races: break
-        try:
-            with open(f) as fh: raw = json.load(fh)
-            races.extend(raw if isinstance(raw, list) else [raw])
-        except: pass
-    print(f"Loaded {len(races)} races", file=sys.stderr)
-    return races[:max_races]
-
-# ── Feature vectors (base_lt and pit_time cancel in same-race pairs) ──────────
-
-def _sa(n):  return n*(n-1)/2
-def _sa2(n): return n*(n-1)*(2*n-1)/6
-
-def fv(stints, dT):
-    """12-element feature vector for linear constraint building."""
+def make_fv(stints, dT):
     ci = {'SOFT':0,'MEDIUM':1,'HARD':2}
     v = np.zeros(12)
-    for c, n in stints:
-        if c not in ci: c = 'MEDIUM'
-        i = ci[c]
-        v[i]   += n
-        v[3+i] += _sa(n)
-        v[6+i] += _sa2(n)
-        v[9+i] += n * dT
+    for c,n in stints:
+        c = _c(c); i = ci.get(c,1)
+        v[i]+=n; v[3+i]+=sa(n); v[6+i]+=sa2(n); v[9+i]+=n*dT
     return v
 
-def parse_race_fast(race):
-    """Parse a race into feature vectors for LP/optimization."""
+def parse_race(race):
     cfg        = race.get('race_config', {})
     total_laps = int(cfg.get('total_laps', 57))
     base_lt    = float(cfg.get('base_lap_time', 90.0))
@@ -87,6 +49,7 @@ def parse_race_fast(race):
     track_temp = float(cfg.get('track_temp', 30.0))
     dT         = track_temp - T_REF
     result     = [str(r) for r in race.get('finishing_positions', [])]
+    if not result: return None
 
     drivers = {}
     for pos_key, strat in race.get('strategies', {}).items():
@@ -96,213 +59,251 @@ def parse_race_fast(race):
         try: gp = int(str(pos_key).replace('pos',''))
         except: gp = 99
         stints = parse_stints(start, pits, total_laps)
-        drivers[did] = {
-            'stints': stints,
-            'fv':     fv(stints, dT),
-            'grid':   gp,
-        }
+        drivers[did] = {'stints':stints,'fv':make_fv(stints,dT),'grid':gp}
 
-    return {
-        'total_laps': total_laps,
-        'base_lt':    base_lt,
-        'pit_time':   pit_time,
-        'track_temp': track_temp,
-        'dT':         dT,
-        'result':     result,
-        'drivers':    drivers,
-    }
+    return {'base_lt':base_lt,'pit_time':pit_time,'track_temp':track_temp,
+            'dT':dT,'result':result,'drivers':drivers}
 
-# ── Stint signature for tiebreaker detection ──────────────────────
-
-def stint_sig(stints):
-    return tuple((c, n) for c, n in stints)
-
-# ── LP: exact parameter recovery ─────────────────────────────────
-
-def build_constraints(parsed_races, nearby=5, max_constraints=200000):
-    rows = []
-    for r in parsed_races:
-        result  = r['result']
-        drivers = r['drivers']
-        sigs    = {d: stint_sig(dd['stints']) for d, dd in drivers.items()}
-
-        for i in range(len(result)):
-            for j in range(i+1, min(i+nearby+1, len(result))):
-                wi, li = result[i], result[j]
-                if wi not in drivers or li not in drivers: continue
-                if sigs.get(wi) == sigs.get(li): continue  # tiebreaker
-                rows.append(drivers[wi]['fv'] - drivers[li]['fv'])
-                if len(rows) >= max_constraints: break
-            if len(rows) >= max_constraints: break
-        if len(rows) >= max_constraints: break
-
-    if not rows: return np.zeros((0, 12))
-    A = np.array(rows)
-    # Deduplicate
-    A = np.unique(A, axis=0)
-    print(f"  {len(A)} unique constraints", file=sys.stderr)
-    return A
-
-def lp_solve(A):
-    """Maximize margin eps: A·theta + eps <= 0."""
-    if len(A) == 0: return None, -9999
-    A_aug = np.hstack([A, np.ones((len(A), 1))])
-    b     = np.zeros(len(A))
-    c_obj = np.zeros(13); c_obj[-1] = -1.0
-    bounds = list(BOUNDS) + [(None, None)]  # eps unbounded
-
-    res = linprog(c_obj, A_ub=A_aug, b_ub=b, bounds=bounds,
-                  method='highs', options={'time_limit': 120, 'disp': False})
-    if not res.success:
-        return None, -9999
-    eps = float(-res.fun)
-    return res.x[:12], eps
-
-# ── Pairwise ranking loss (for gradient-based polish) ─────────────
-
-def pairwise_loss(x, parsed_races, margin=0.01, nearby=5):
-    total = 0.0; n = 0
-    for r in parsed_races:
-        result  = r['result']
-        drivers = r['drivers']
-        sigs    = {d: stint_sig(dd['stints']) for d, dd in drivers.items()}
-        # dot-product times (base_lt and pit cancel within a race)
-        times   = {d: float(np.dot(dd['fv'], x)) for d, dd in drivers.items()}
-
-        for i in range(len(result)):
-            for j in range(i+1, min(i+nearby+1, len(result))):
-                wi, li = result[i], result[j]
-                if wi not in times or li not in times: continue
-                if sigs.get(wi) == sigs.get(li): continue
-                total += max(0.0, times[wi] - times[li] + margin) ** 2
-                n += 1
-    return total / max(1, n)
-
-# ── Evaluation ────────────────────────────────────────────────────
-
-def sim_parsed(r, params):
-    """Simulate a pre-parsed race."""
-    times = {}
-    for did, d in r['drivers'].items():
-        t = round(driver_time(d['stints'], r['base_lt'], r['track_temp'],
-                              r['pit_time'], params), TIME_ROUND)
-        times[did] = (t, d['grid'])
-    return [d for d, _ in sorted(times.items(), key=lambda z: (z[1][0], z[1][1]))]
-
-def evaluate(parsed, params, n=500, label=''):
-    exact = pos = total = 0
-    for r in parsed[:n]:
-        pred = sim_parsed(r, params)
-        exp  = r['result']
-        if pred == exp: exact += 1
-        pos   += sum(1 for p, e in zip(pred, exp) if p == e)
-        total += len(exp)
-    nr = min(n, len(parsed))
-    tag = f"[{label}] " if label else ""
-    print(f"  {tag}Exact {exact}/{nr} ({100*exact/nr:.1f}%)  "
-          f"Pos {100*pos/total:.1f}%", file=sys.stderr)
-    return exact / nr
-
-def vec_to_params(x, base_params=None):
-    p = dict(base_params or DEFAULT_PARAMS)
-    p.update({n: float(v) for n, v in zip(NAMES, x)})
-    return p
-
-# ── Main pipeline ─────────────────────────────────────────────────
-
-def fit(data_dir='data', max_races=30000, output='solution/params.json'):
-    print("=" * 65, file=sys.stderr)
-    print("Box Box Box — Global Parameter Fitter", file=sys.stderr)
-    print("=" * 65, file=sys.stderr)
-
-    # Load & parse
-    races_raw = load_all(data_dir, max_races)
-    print("Parsing races...", file=sys.stderr)
-    parsed = []
-    for race in races_raw:
-        try: parsed.append(parse_race_fast(race))
+def load_races(data_dir, max_races=30000):
+    files = sorted(glob.glob(os.path.join(data_dir,'historical_races','*.json')))
+    races = []
+    for f in files:
+        if len(races)>=max_races: break
+        try:
+            with open(f) as fh: raw=json.load(fh)
+            races.extend(raw if isinstance(raw,list) else [raw])
         except: pass
-    print(f"Parsed {len(parsed)} races successfully", file=sys.stderr)
+    return races[:max_races]
 
-    # ── Phase 1: LP ───────────────────────────────────────────────
-    print("\n── Phase 1: LP ──────────────────────────────────────────", file=sys.stderr)
-    A = build_constraints(parsed, nearby=5, max_constraints=300000)
-    x_lp, eps_lp = lp_solve(A)
-    print(f"  LP eps = {eps_lp:.4f}", file=sys.stderr)
+# ── constraint builder ────────────────────────────────────────────────────────
 
-    if x_lp is not None:
-        params_lp = vec_to_params(x_lp)
-        evaluate(parsed, params_lp, n=min(1000, len(parsed)), label='LP')
-        x_best = x_lp
-    else:
-        print("  LP failed, using research defaults", file=sys.stderr)
-        x_best = INIT.copy()
+def build_constraints(parsed, nearby=3):
+    """Extract ordering constraints from parsed races."""
+    rows = []
+    for r in parsed:
+        result, drivers = r['result'], r['drivers']
+        sigs = {d:tuple(dd['stints']) for d,dd in drivers.items()}
+        for i in range(len(result)):
+            for j in range(i+1, min(i+nearby+1, len(result))):
+                wi,li = result[i],result[j]
+                if wi not in drivers or li not in drivers: continue
+                if sigs.get(wi)==sigs.get(li): continue
+                rows.append(drivers[wi]['fv'] - drivers[li]['fv'])
+    return np.array(rows) if rows else np.zeros((0,12))
 
-    # ── Phase 2: Differential Evolution (global search) ───────────
-    print("\n── Phase 2: Differential Evolution ─────────────────────", file=sys.stderr)
-    sample_size = min(3000, len(parsed))
-    idx = np.random.choice(len(parsed), sample_size, replace=False)
-    sample = [parsed[i] for i in idx]
+# ── LP solver ─────────────────────────────────────────────────────────────────
 
-    de = differential_evolution(
-        pairwise_loss,
-        BOUNDS,
-        args=(sample, 0.02, 5),
-        maxiter=500,
-        popsize=15,
-        tol=1e-10,
-        seed=42,
-        disp=False,
-        workers=1,
-        x0=x_best,
-        init='sobol',
-        mutation=(0.5, 1.5),
-        recombination=0.9,
-    )
-    print(f"  DE loss = {de.fun:.8f}", file=sys.stderr)
-    params_de = vec_to_params(de.x)
-    acc_de = evaluate(parsed, params_de, n=min(1000, len(parsed)), label='DE')
-    params_lp_acc = evaluate(parsed, vec_to_params(x_best), n=min(1000, len(parsed)), label='LP') if x_lp is not None else 0
+def run_lp(A, time_limit=30):
+    if len(A)==0: return None, -9999
+    # Deduplicate
+    A = np.unique(np.round(A,6), axis=0)
+    A_aug = np.hstack([A, np.ones((len(A),1))])
+    b = np.zeros(len(A))
+    c_obj = np.zeros(13); c_obj[-1]=-1.0
+    bounds = list(BOUNDS)+[(None,None)]
+    try:
+        res = linprog(c_obj, A_ub=A_aug, b_ub=b, bounds=bounds, method='highs',
+                      options={'time_limit':time_limit,'primal_feasibility_tolerance':1e-8})
+        eps = -res.fun if res.success else -9999
+        return (res.x[:12] if res.success else None), eps
+    except: return None, -9999
 
-    x_best = de.x if acc_de >= params_lp_acc else x_best
+# ── local NM polish ───────────────────────────────────────────────────────────
 
-    # ── Phase 3: Nelder-Mead polish ───────────────────────────────
-    print("\n── Phase 3: Nelder-Mead polish ──────────────────────────", file=sys.stderr)
-    nm = minimize(
-        pairwise_loss,
-        x_best,
-        args=(sample, 0.005, 5),
-        method='Nelder-Mead',
-        options={'maxiter': 500000, 'xatol': 1e-12, 'fatol': 1e-12, 'disp': False}
-    )
-    print(f"  NM loss = {nm.fun:.10f}", file=sys.stderr)
-    params_nm = vec_to_params(nm.x)
-    acc_nm = evaluate(parsed, params_nm, n=min(1000, len(parsed)), label='NM')
+def pairwise_loss(x, A, margin=0.01):
+    """Fast loss using precomputed constraint matrix."""
+    if len(A)==0: return 0.0
+    scores = A @ x  # shape (n_constraints,)
+    violations = np.maximum(0.0, scores + margin)
+    return float(np.mean(violations**2))
 
-    if acc_nm > evaluate(parsed, vec_to_params(x_best), n=50, label='prev'):
-        x_best = nm.x
+def nm_polish(x0, A, margin=0.005, maxiter=20000):
+    res = minimize(pairwise_loss, x0, args=(A, margin), method='Nelder-Mead',
+                   options={'maxiter':maxiter,'xatol':1e-10,'fatol':1e-10,'adaptive':True})
+    return res.x, res.fun
 
-    # ── Phase 4: Full dataset evaluation ─────────────────────────
-    print("\n── Final Evaluation ─────────────────────────────────────", file=sys.stderr)
-    params_final = vec_to_params(x_best)
-    evaluate(parsed, params_final, n=len(parsed), label='FINAL')
+# ── evaluation ────────────────────────────────────────────────────────────────
 
-    print("\nLearned parameters:", file=sys.stderr)
-    for n, v in zip(NAMES, x_best):
-        print(f"  {n:20s} = {v:.8f}", file=sys.stderr)
+def evaluate(parsed, x, n_eval=500):
+    params = dict(zip(NAMES, x))
+    exact = pos_ok = total_pos = 0
+    for r in parsed[:n_eval]:
+        result,drivers = r['result'],r['drivers']
+        tl = [(round(driver_time(d['stints'],r['base_lt'],r['track_temp'],
+                                  r['pit_time'],params), TIME_ROUND),
+               d['grid'], did) for did,d in drivers.items()]
+        tl.sort(key=lambda z:(z[0],z[1]))
+        pred = [z[2] for z in tl]
+        if pred==result: exact+=1
+        pos_ok    += sum(1 for p,e in zip(pred,result) if p==e)
+        total_pos += len(result)
+    n = min(n_eval, len(parsed))
+    pct = 100*exact/n
+    pa  = 100*pos_ok/total_pos if total_pos else 0
+    return exact, n, pct, pa
 
-    # ── Save ──────────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
-    with open(output, 'w') as f:
-        json.dump(params_final, f, indent=2)
-    print(f"\nSaved to {output}", file=sys.stderr)
-    return params_final
+# ── CHUNKED FITTER ────────────────────────────────────────────────────────────
 
+def fit_chunked(data_dir, chunk_size=1000, max_races=30000,
+                output='solution/params.json', lp_only=False):
+
+    print("="*60)
+    print("Box Box Box — Chunked Parameter Fitter")
+    print("="*60)
+
+    # Load & parse all races
+    print(f"\nLoading races...", flush=True)
+    raw = load_races(data_dir, max_races)
+    print(f"  Loaded {len(raw)} raw races")
+
+    print(f"  Parsing...", flush=True)
+    parsed = []
+    for race in raw:
+        try:
+            p = parse_race(race)
+            if p: parsed.append(p)
+        except: pass
+    print(f"  Parsed {len(parsed)} races")
+
+    # Load existing best params as starting point
+    best_x = np.array([DEFAULT_PARAMS.get(n,0.0) for n in NAMES])
+    best_params_path = output
+    if os.path.exists(best_params_path):
+        try:
+            with open(best_params_path) as f:
+                saved = json.load(f)
+            best_x = np.array([saved.get(n, DEFAULT_PARAMS.get(n,0.0)) for n in NAMES])
+            print(f"\n  Loaded existing params from {best_params_path}")
+        except: pass
+
+    # Evaluate starting params
+    exact,n,pct,pa = evaluate(parsed, best_x, n_eval=min(500, len(parsed)))
+    print(f"\n  Starting params: {exact}/{n} exact ({pct:.1f}%)  pos={pa:.1f}%")
+
+    # ── Chunk processing ──────────────────────────────────────────────
+    n_chunks = (len(parsed) + chunk_size - 1) // chunk_size
+    print(f"\n  Processing {n_chunks} chunks of ~{chunk_size} races each")
+    print(f"  Mode: {'LP only' if lp_only else 'LP + NM polish'}")
+    print("="*60)
+
+    all_constraints = []
+    chunk_x_list = []
+
+    for chunk_idx in range(n_chunks):
+        t0 = time.time()
+        start = chunk_idx * chunk_size
+        end   = min(start + chunk_size, len(parsed))
+        chunk = parsed[start:end]
+
+        # Build constraints for this chunk
+        A_chunk = build_constraints(chunk, nearby=3)
+        all_constraints.append(A_chunk)
+
+        # LP on this chunk
+        x_lp, eps = run_lp(A_chunk, time_limit=15)
+
+        if x_lp is not None and eps > -50:
+            if lp_only:
+                x_chunk = x_lp
+            else:
+                # Quick NM polish on chunk constraints
+                x_chunk, loss = nm_polish(x_lp, A_chunk, margin=0.002, maxiter=5000)
+            chunk_x_list.append(x_chunk)
+            status = f"eps={eps:.2f}"
+        else:
+            # LP failed on this chunk — use current best
+            chunk_x_list.append(best_x)
+            status = "LP failed, using current best"
+
+        elapsed = time.time()-t0
+        print(f"  Chunk {chunk_idx+1:3d}/{n_chunks}  races {start+1}-{end:5d}  "
+              f"{status}  [{elapsed:.1f}s]", flush=True)
+
+        # Every 5 chunks, compute running average and evaluate
+        if (chunk_idx+1) % 5 == 0 or chunk_idx == n_chunks-1:
+            # Weighted average of chunk solutions
+            if chunk_x_list:
+                x_avg = np.mean(chunk_x_list, axis=0)
+                # Clip to bounds
+                for i,(lo,hi) in enumerate(BOUNDS):
+                    if lo is not None: x_avg[i] = max(lo, x_avg[i])
+                    if hi is not None: x_avg[i] = min(hi, x_avg[i])
+
+                exact,n,pct,pa = evaluate(parsed, x_avg, n_eval=min(500,len(parsed)))
+                print(f"  ── Checkpoint: {exact}/{n} ({pct:.1f}%)  pos={pa:.1f}%")
+
+                # Save if better
+                if pct >= (100*evaluate(parsed, best_x, n_eval=min(100,len(parsed)))[0]/
+                           min(100,len(parsed))) - 1:
+                    best_x = x_avg
+                    save_params(best_x, output)
+                    print(f"  ── Saved checkpoint to {output}")
+
+    # ── Global LP on ALL constraints ──────────────────────────────────
+    print(f"\n{'='*60}")
+    print("Global LP on all constraints...", flush=True)
+    A_all = np.vstack([a for a in all_constraints if len(a)>0])
+    print(f"  Total constraints: {len(A_all)}")
+
+    x_global, eps_global = run_lp(A_all, time_limit=60)
+    print(f"  Global LP: eps={eps_global:.4f}")
+
+    if x_global is not None and eps_global > -100:
+        exact,n,pct,pa = evaluate(parsed, x_global, n_eval=min(1000,len(parsed)))
+        print(f"  Global LP accuracy: {exact}/{n} ({pct:.1f}%)  pos={pa:.1f}%")
+
+        # Final NM polish on ALL constraints (capped at 200k)
+        if not lp_only:
+            print("Final NM polish on global constraints...", flush=True)
+            A_cap = A_all[:200000]
+            x_final, loss = nm_polish(x_global, A_cap, margin=0.001, maxiter=50000)
+            exact2,n2,pct2,pa2 = evaluate(parsed, x_final, n_eval=min(1000,len(parsed)))
+            print(f"  After NM: {exact2}/{n2} ({pct2:.1f}%)  pos={pa2:.1f}%")
+            if pct2 >= pct:
+                x_global = x_final
+
+        exact,n,pct,pa = evaluate(parsed, x_global, n_eval=min(1000,len(parsed)))
+        if pct >= (100*evaluate(parsed, best_x, n_eval=min(100,len(parsed)))[0]/
+                   min(100,len(parsed))) - 1:
+            best_x = x_global
+
+    # ── Final save ────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    exact,n,pct,pa = evaluate(parsed, best_x, n_eval=len(parsed))
+    print(f"FINAL: {exact}/{n} ({pct:.1f}%)  pos={pa:.1f}%")
+
+    save_params(best_x, output)
+    print(f"Saved final params to {output}")
+
+    print("\nFinal parameter values:")
+    for name, val in zip(NAMES, best_x):
+        print(f"  {name:20s} = {val:.8f}")
+
+    return best_x
+
+def save_params(x, path):
+    params = dict(DEFAULT_PARAMS)
+    params.update({n:float(v) for n,v in zip(NAMES,x)})
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path,'w') as f: json.dump(params,f,indent=2)
+
+# ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data-dir', default='data')
-    ap.add_argument('--max-races', type=int, default=30000)
-    ap.add_argument('--output', default='solution/params.json')
+    ap.add_argument('--data-dir',    default='data')
+    ap.add_argument('--chunk-size',  type=int, default=1000)
+    ap.add_argument('--max-races',   type=int, default=30000)
+    ap.add_argument('--output',      default='solution/params.json')
+    ap.add_argument('--quick',       action='store_true',
+                    help='Fast mode: 2000 races only (~2 min)')
+    ap.add_argument('--lp-only',     action='store_true',
+                    help='LP only, no NM polish (fastest)')
     args = ap.parse_args()
-    fit(args.data_dir, args.max_races, args.output)
+
+    if args.quick:
+        args.max_races  = 2000
+        args.chunk_size = 500
+
+    fit_chunked(args.data_dir, args.chunk_size, args.max_races,
+                args.output, args.lp_only)
